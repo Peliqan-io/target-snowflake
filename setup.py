@@ -11,7 +11,7 @@ setup(name="pipelinewise-target-snowflake",
       long_description=long_description,
       long_description_content_type='text/markdown',
       author="Wise",
-      url='https://github.com/transferwise/pipelinewise-target-snowflake',
+      url='https://github.com/Peliqan-io/target-snowflake',
       classifiers=[
           'License :: OSI Approved :: Apache Software License',
           'Programming Language :: Python :: 3 :: Only',
