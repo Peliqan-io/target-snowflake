@@ -52,6 +52,29 @@ def flatten_schema(d, parent_key=None, sep='__', level=0, max_level=0):
                 items.extend(flatten_schema(v, parent_key + [k], sep=sep, level=level + 1, max_level=max_level).items())
             else:
                 items.append((new_key, v))
+        elif 'anyOf' in v.keys():
+            # Seems like the type of the property can be any of multiple types
+            types = v['anyOf']
+
+            all_types = []
+            for type_ in types:
+                if 'type' in type_.keys():
+                    if isinstance(type_['type'], list):
+                        for type__ in type_['type']:
+                            all_types.append(type__)
+                    else:
+                        all_types.append(type_['type'])
+
+            if 'string' in all_types:
+                items.append((new_key, {
+                    'type': ['null', 'string']
+                }))
+            else:
+                all_types.remove('null')
+                items.append((new_key, {
+                    'type': ['null', all_types[0]]
+                }))
+
         elif len(v.values()) > 0:
             value_type = list(v.values())[0][0]['type']
             if value_type in ['string', 'array', 'object']:

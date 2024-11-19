@@ -113,7 +113,9 @@ def column_trans(schema_property):
 
 def safe_column_name(name):
     """Generate SQL friendly column name"""
-    return f'"{name}"'.upper()
+    # Note : Unicode characters are not replaced
+    normalized_name = re.sub(r"[^\w]", "_", name)
+    return normalized_name.upper()
 
 
 def json_element_name(name):
