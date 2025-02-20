@@ -14,6 +14,9 @@ from target_snowflake.exceptions import TooManyRecordsException, PrimaryKeyNotFo
 from target_snowflake.upload_clients.s3_upload_client import S3UploadClient
 from target_snowflake.upload_clients.snowflake_upload_client import SnowflakeUploadClient
 
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+
 
 def validate_config(config):
     """Validate configuration"""
@@ -293,9 +296,52 @@ class DbSync:
         if self.stream_schema_message:
             stream = self.stream_schema_message['stream']
 
+        private_key = self.connection_config.get('private_key', None)
+
+        # Auth parameters later injected in the connection
+        auth_parameters = {}
+
+        if private_key:
+            # Key based authentication
+            # Prepare the key for authentication 
+            # In key based authentication the password field conatains the pass phrase
+            password = self.connection_config['password']
+
+            if password:
+                # The private key is encrypted
+                private_key = serialization.load_pem_private_key(
+                    private_key.encode(),
+                    password=password.encode(),
+                    backend=default_backend()
+                )
+            else:
+                # The private key is not encrypted
+                private_key = serialization.load_pem_private_key(
+                    private_key.encode(),
+                    password=None,
+                    backend=default_backend()
+                )
+            
+            # Convert the private key from PEM encoding to DER encoding
+            private_key_bytes = private_key.private_bytes(
+                encoding=serialization.Encoding.DER,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            )
+
+            auth_parameters = {
+                'private_key': private_key_bytes
+            }
+        
+        else:
+            # Password based authentication
+            auth_parameters = {
+                'password': self.connection_config['password']
+            }
+
+
         return snowflake.connector.connect(
             user=self.connection_config['user'],
-            password=self.connection_config['password'],
             account=self.connection_config['account'],
             database=self.connection_config['dbname'],
             warehouse=self.connection_config['warehouse'],
@@ -308,7 +354,8 @@ class DbSync:
                                               database=self.connection_config['dbname'],
                                               schema=self.schema_name,
                                               table=self.table_name(stream, False, True))
-            }
+            },
+            **auth_parameters
         )
 
     def query(self, query: Union[str, List[str]], params: Dict = None, max_records=0) -> List[Dict]:
