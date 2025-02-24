@@ -25,7 +25,6 @@ def validate_config(config):
         'account',
         'dbname',
         'user',
-        'password',
         'warehouse',
         's3_bucket',
         'stage',
@@ -36,7 +35,6 @@ def validate_config(config):
         'account',
         'dbname',
         'user',
-        'password',
         'warehouse',
         'file_format'
     ]
