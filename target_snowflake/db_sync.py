@@ -303,7 +303,7 @@ class DbSync:
             # Key based authentication
             # Prepare the key for authentication 
             # In key based authentication the password field conatains the pass phrase
-            password = self.connection_config['password']
+            password = self.connection_config.get('password', None)
 
             if password:
                 # The private key is encrypted
