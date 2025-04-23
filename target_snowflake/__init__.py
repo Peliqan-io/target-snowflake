@@ -33,7 +33,8 @@ logging.getLogger('snowflake.connector').setLevel(logging.WARNING)
 
 DEFAULT_BATCH_SIZE_ROWS = 100000
 DEFAULT_PARALLELISM = 0  # 0 The number of threads used to flush tables
-DEFAULT_MAX_PARALLELISM = 16  # Don't use more than this number of threads by default when flushing streams in parallel
+# Only run one job at a time => otherwise huge mem usage because of table_cache
+DEFAULT_MAX_PARALLELISM = 1  
 
 
 def add_metadata_columns_to_schema(schema_message):
@@ -71,10 +72,10 @@ def get_snowflake_statics(config):
         tuple of retrieved items: table_cache, file_format_type
     """
     table_cache = []
+    db = DbSync(config)  # pylint: disable=invalid-name
     if not ('disable_table_cache' in config and config['disable_table_cache']):
         LOGGER.info('Getting catalog objects from table cache...')
 
-        db = DbSync(config)  # pylint: disable=invalid-name
         table_cache = db.get_table_columns(
             table_schemas=stream_utils.get_schema_names_from_config(config))
 
@@ -517,6 +518,9 @@ def main():
             config = json.load(config_input)
     else:
         config = {}
+
+    # Always disable table cache
+    config['disable_table_cache'] = True
 
     # Init columns cache
     table_cache, file_format_type = get_snowflake_statics(config)

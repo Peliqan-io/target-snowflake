@@ -702,14 +702,17 @@ class DbSync:
         return tables
 
     def get_table_columns(self, table_schemas=None):
-        """Get list of columns and tables of certain schema(s) from snowflake metadata"""
+        """Get list of columns of a particular table from the particular schema"""
         table_columns = []
         if table_schemas:
             for schema in table_schemas:
                 queries = []
 
+                stream_schema_message = self.stream_schema_message
+                stream = stream_schema_message['stream']
+                table_name = self.table_name(stream, False)
                 # Get column data types by SHOW COLUMNS
-                show_columns = f"SHOW COLUMNS IN SCHEMA {self.connection_config['dbname']}.{schema}"
+                show_columns = f"SHOW COLUMNS IN TABLE {self.connection_config['dbname']}.{table_name}"
 
                 # Convert output of SHOW COLUMNS to table and insert results into the cache COLUMNS table
                 #
@@ -765,19 +768,14 @@ class DbSync:
         stream_schema_message = self.stream_schema_message
         stream = stream_schema_message['stream']
         table_name = self.table_name(stream, False, True)
-        all_table_columns = []
+        table_columns = []
 
         if self.table_cache:
-            all_table_columns = self.table_cache
+            table_columns = self.table_cache
         else:
-            all_table_columns = self.get_table_columns(table_schemas=[self.schema_name])
+            table_columns = self.get_table_columns(table_schemas=[self.schema_name])
 
-        # Find the specific table
-        columns = list(filter(lambda x: x['SCHEMA_NAME'] == self.schema_name.upper() and
-                                        f'"{x["TABLE_NAME"].upper()}"' == table_name,
-                              all_table_columns))
-
-        columns_dict = {column['COLUMN_NAME'].upper(): column for column in columns}
+        columns_dict = {column['COLUMN_NAME'].upper(): column for column in table_columns}
 
         columns_to_add = [
             column_clause(
