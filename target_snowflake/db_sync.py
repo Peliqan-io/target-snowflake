@@ -381,7 +381,7 @@ class DbSync:
                 qid = None
 
                 # pylint: disable=invalid-name
-                for q in queries:
+                for i, q in enumerate(queries):
 
                     # update the LAST_QID
                     params['LAST_QID'] = qid
@@ -391,12 +391,13 @@ class DbSync:
                     cur.execute(q, params)
                     qid = cur.sfqid
 
-                    # Raise exception if returned rows greater than max allowed records
-                    if 0 < max_records < cur.rowcount:
-                        raise TooManyRecordsException(
-                            f"Query returned too many records. This query can return max {max_records} records")
+                    if i == len(queries) - 1:
+                        # Raise exception if returned rows greater than max allowed records
+                        if 0 < max_records < cur.rowcount:
+                            raise TooManyRecordsException(
+                                f"Query returned too many records. This query can return max {max_records} records")
 
-                    result = cur.fetchall()
+                        result = cur.fetchall()
 
         return result
 
@@ -650,12 +651,7 @@ class DbSync:
         schema_name = self.schema_name
         schema_rows = 0
 
-        # table_cache is an optional pre-collected list of available objects in snowflake
-        if self.table_cache:
-            schema_rows = list(filter(lambda x: x['SCHEMA_NAME'] == schema_name.upper(), self.table_cache))
-        # Query realtime if not pre-collected
-        else:
-            schema_rows = self.query(f"SHOW SCHEMAS LIKE '{schema_name.upper()}'")
+        schema_rows = self.query(f"SHOW SCHEMAS LIKE '{schema_name.upper()}'")
 
         if len(schema_rows) == 0:
             query = f"CREATE SCHEMA IF NOT EXISTS {schema_name}"
@@ -723,10 +719,8 @@ class DbSync:
                 # Further info at https://docs.snowflake.net/manuals/sql-reference/sql/show-columns.html
                 # ----------------------------------------------------------------------------------------
                 select = """
-                    SELECT "schema_name" AS schema_name
-                          ,"table_name"  AS table_name
-                          ,"column_name" AS column_name
-                          ,CASE PARSE_JSON("data_type"):type::varchar
+                    SELECT "column_name" AS column_name,
+                          CASE PARSE_JSON("data_type"):type::varchar
                              WHEN 'FIXED' THEN 'NUMBER'
                              WHEN 'REAL'  THEN 'FLOAT'
                              ELSE PARSE_JSON("data_type"):type::varchar
@@ -783,7 +777,7 @@ class DbSync:
                 properties_schema
             )
             for (name, properties_schema) in self.flatten_schema.items()
-            if name.upper() not in columns_dict
+            if safe_column_name(name) not in columns_dict
         ]
 
         for column in columns_to_add:
@@ -795,7 +789,7 @@ class DbSync:
                 properties_schema
             ))
             for (name, properties_schema) in self.flatten_schema.items()
-            if name.upper() in columns_dict and
+            if safe_column_name(name) in columns_dict and
                columns_dict[name.upper()]['DATA_TYPE'].upper() != column_type(properties_schema).upper() and
 
                # Don't alter table if TIMESTAMP_NTZ detected as the new required column type
@@ -845,13 +839,8 @@ class DbSync:
         table_name = self.table_name(stream, False, True)
         table_name_with_schema = self.table_name(stream, False)
 
-        if self.table_cache:
-            found_tables = list(filter(lambda x: x['SCHEMA_NAME'] == self.schema_name.upper() and
-                                                 f'"{x["TABLE_NAME"].upper()}"' == table_name,
-                                       self.table_cache))
-        else:
-            found_tables = [table for table in (self.get_tables([self.schema_name.upper()]))
-                            if f'"{table["TABLE_NAME"].upper()}"' == table_name]
+        found_tables = [table for table in (self.get_tables([self.schema_name.upper()]))
+                        if f'"{table["TABLE_NAME"].upper()}"' == table_name]
 
         if len(found_tables) == 0:
             query = self.create_table_query()
