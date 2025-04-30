@@ -31,10 +31,7 @@ LOGGER = get_logger('target_snowflake')
 # Tone down snowflake.connector log noise by only outputting warnings and higher level messages
 logging.getLogger('snowflake.connector').setLevel(logging.WARNING)
 
-DEFAULT_BATCH_SIZE_ROWS = 100000
-DEFAULT_PARALLELISM = 0  # 0 The number of threads used to flush tables
-# Only run one job at a time => otherwise huge mem usage because of table_cache
-DEFAULT_MAX_PARALLELISM = 1  
+DEFAULT_BATCH_SIZE_ROWS = 10000
 
 
 def add_metadata_columns_to_schema(schema_message):
@@ -358,30 +355,15 @@ def flush_streams(
     :param archive_load_files_data: dictionary of dictionaries containing archive load files data
     :return: State dict with flushed positions
     """
-    parallelism = config.get("parallelism", DEFAULT_PARALLELISM)
-    max_parallelism = config.get("max_parallelism", DEFAULT_MAX_PARALLELISM)
-
-    # Parallelism 0 means auto parallelism:
-    #
-    # Auto parallelism trying to flush streams efficiently with auto defined number
-    # of threads where the number of threads is the number of streams that need to
-    # be loaded but it's not greater than the value of max_parallelism
-    if parallelism == 0:
-        n_streams_to_flush = len(streams.keys())
-        if n_streams_to_flush > max_parallelism:
-            parallelism = max_parallelism
-        else:
-            parallelism = n_streams_to_flush
-
     # Select the required streams to flush
     if filter_streams:
         streams_to_flush = filter_streams
     else:
         streams_to_flush = streams.keys()
 
-    # Single-host, thread-based parallelism
-    with parallel_backend('threading', n_jobs=parallelism):
-        Parallel()(delayed(load_stream_batch)(
+    # Sequentially flush each stream (no parallelism)
+    for stream in streams_to_flush:
+        load_stream_batch(
             stream=stream,
             records=streams[stream],
             row_count=row_count,
@@ -390,7 +372,7 @@ def flush_streams(
             delete_rows=config.get('hard_delete'),
             temp_dir=config.get('temp_dir'),
             archive_load_files=copy.copy(archive_load_files_data.get(stream, None))
-        ) for stream in streams_to_flush)
+        )
 
     # reset flushed stream records to empty to avoid flushing same records
     for stream in streams_to_flush:
