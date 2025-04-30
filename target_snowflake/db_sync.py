@@ -789,7 +789,7 @@ class DbSync:
                 properties_schema
             ))
             for (name, properties_schema) in self.flatten_schema.items()
-            if name.upper() in columns_dict and
+            if safe_column_name(name) in columns_dict and
                columns_dict[name.upper()]['DATA_TYPE'].upper() != column_type(properties_schema).upper() and
 
                # Don't alter table if TIMESTAMP_NTZ detected as the new required column type
