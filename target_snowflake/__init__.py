@@ -303,7 +303,10 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
                         )
 
                 stream_to_sync[stream].create_schema_if_not_exists()
-                stream_to_sync[stream].sync_table()
+                try:
+                    stream_to_sync[stream].sync_table()
+                except Exception as ex:
+                    LOGGER.error("Failed to sync table for stream %s: %s", stream, ex)
 
                 row_count[stream] = 0
                 total_row_count[stream] = 0
@@ -449,9 +452,14 @@ def flush_records(stream: str,
     row_count = len(records)
     size_bytes = os.path.getsize(filepath)
 
+    upload_failed = False
     # Upload to s3 and load into Snowflake
-    s3_key = db_sync.put_to_stage(filepath, stream, row_count, temp_dir=temp_dir)
-    db_sync.load_file(s3_key, row_count, size_bytes)
+    try:
+        s3_key = db_sync.put_to_stage(filepath, stream, row_count, temp_dir=temp_dir)
+        db_sync.load_file(s3_key, row_count, size_bytes)
+    except Exception as ex:
+        LOGGER.error("Failed to load file %s into Snowflake: %s", filepath, ex)
+        upload_failed = True
 
     # Delete file from local disk
     os.remove(filepath)
@@ -483,10 +491,18 @@ def flush_records(stream: str,
         archive_file = os.path.basename(s3_key)
         archive_key = f"{archive_tap}/{archive_table}/{archive_file}"
 
-        db_sync.copy_to_archive(s3_key, archive_key, archive_metadata)
+        try:
+            # Copy file to archive
+            db_sync.copy_to_archive(s3_key, archive_key, archive_metadata)
+        except Exception as ex:
+            LOGGER.error("Failed to copy file %s to archive: %s", s3_key, ex)
 
-    # Delete file from S3
-    db_sync.delete_from_stage(stream, s3_key)
+    try:
+        if not upload_failed:
+            # Delete file from S3
+            db_sync.delete_from_stage(stream, s3_key)
+    except Exception as ex:
+        LOGGER.error("Failed to delete file from S3: %s", ex)
 
 
 def main():

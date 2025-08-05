@@ -114,9 +114,31 @@ def column_trans(schema_property):
 
 def safe_column_name(name):
     """Generate SQL friendly column name"""
+
+    # Full reserved keyword set (Snowflake + ANSI)
+    RESERVED_KEYWORDS = {
+        "ACCOUNT", "ALL", "ALTER", "AND", "ANY", "AS", "B", "BETWEEN", "BY",
+        "CASE", "CAST", "CHECK", "COLUMN", "CONNECT", "CONNECTION", "CONSTRAINT",
+        "CREATE", "CROSS", "CURRENT", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER",
+        "DATABASE", "DELETE", "DISTINCT", "DROP", "ELSE", "EXISTS", "FALSE", "FOLLOWING",
+        "FOR", "FROM", "FULL", "GRANT", "GROUP", "GSCLUSTER", "HAVING", "ILIKE", "IN",
+        "INCREMENT", "INNER", "INSERT", "INTERSECT", "INTO", "IS", "ISSUE", "JOIN", "LATERAL",
+        "LEFT", "LIKE", "LOCALTIME", "LOCALTIMESTAMP", "MINUS", "NATURAL", "NOT", "NULL",
+        "OF", "ON", "OR", "ORDER", "ORGANIZATION", "QUALIFY", "REGEXP", "REVOKE", "RIGHT",
+        "RLIKE", "ROW", "ROWS", "SAMPLE", "SCHEMA", "SELECT", "SET", "SOME", "START",
+        "TABLE", "TABLESAMPLE", "THEN", "TO", "TRIGGER", "TRUE", "TRY_CAST", "UNION", "UNIQUE",
+        "UPDATE", "USING", "VALUES", "VIEW", "WHEN", "WHENEVER", "WHERE", "WINDOW", "WITH"
+    }
+
     # Note : Unicode characters are not replaced
     normalized_name = re.sub(r"[^\w]", "_", name)
-    return normalized_name.upper()
+    normalized_upper = normalized_name.upper()
+
+    # If it's a reserved keyword, quote it
+    if normalized_upper in RESERVED_KEYWORDS:
+        return f'"{normalized_upper}"'
+
+    return normalized_upper
 
 
 def json_element_name(name):
