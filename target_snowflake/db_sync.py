@@ -709,6 +709,9 @@ class DbSync:
 
                 # Run everything in one transaction
                 try:
+                    # We run the table query only once, and since our
+                    # pipelines only write to one schema,
+                    # we dont need per schema cache
                     if len(_tables_cache) == 0:
                         _tables_cache = self.query(queries, max_records=99999)
 
