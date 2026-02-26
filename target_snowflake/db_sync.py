@@ -17,6 +17,9 @@ from target_snowflake.upload_clients.snowflake_upload_client import SnowflakeUpl
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
+# Cache for get_tables() to avoid redundant SHOW TABLES queries per pipeline run
+_tables_cache = []
+
 
 def validate_config(config):
     """Validate configuration"""
@@ -688,7 +691,7 @@ class DbSync:
 
     def get_tables(self, table_schemas=None):
         """Get list of tables of certain schema(s) from snowflake metadata"""
-        tables = []
+        global _tables_cache
         if table_schemas:
             for schema in table_schemas:
                 queries = []
@@ -706,7 +709,11 @@ class DbSync:
 
                 # Run everything in one transaction
                 try:
-                    tables = self.query(queries, max_records=99999)
+                    # We run the table query only once, and since our
+                    # pipelines only write to one schema,
+                    # we dont need per schema cache
+                    if len(_tables_cache) == 0:
+                        _tables_cache = self.query(queries, max_records=99999)
 
                 # Catch exception when schema not exists and SHOW TABLES throws a ProgrammingError
                 # Regexp to extract snowflake error code and message from the exception message
@@ -717,7 +724,7 @@ class DbSync:
         else:
             raise Exception("Cannot get table columns. List of table schemas empty")
 
-        return tables
+        return _tables_cache
 
     def get_table_columns(self, table_schemas=None):
         """Get list of columns of a particular table from the particular schema"""
