@@ -24,7 +24,7 @@ setup(name="pipelinewise-target-snowflake",
       py_modules=["target_snowflake"],
       python_requires='>=3.7',
       install_requires=[
-          'pipelinewise-singer-python @ git+https://github.com/peliqan-io/pipelinewise-singer-python@master',
+          'pipelinewise-singer-python @ git+https://github.com/peliqan-io/pipelinewise-singer-python@python-311-migration',
           'snowflake-connector-python[pandas]==3.15.0',
           'numpy==1.26.*',
           'inflection==0.5.1',
