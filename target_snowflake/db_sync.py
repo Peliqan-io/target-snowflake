@@ -20,6 +20,11 @@ from cryptography.hazmat.primitives import serialization
 # Cache for get_tables() to avoid redundant SHOW TABLES queries per pipeline run
 _tables_cache = []
 
+# Marker prefix for Peliqan temporary/staging tables. Any table whose name starts
+# with this (case-insensitive) is an intermediate table created during a load and
+# must be excluded from schema discovery and cleaned up by the Peliqan backend.
+TEMP_TABLE_MARKER = 'pqtemp__'
+
 
 def validate_config(config):
     """Validate configuration"""
@@ -436,7 +441,7 @@ class DbSync:
         sf_table_name = table_name.replace('.', '_').replace('-', '_').lower()
 
         if is_temporary:
-            sf_table_name = f'{sf_table_name}_temp'
+            sf_table_name = f'{TEMP_TABLE_MARKER}{sf_table_name}_temp'
 
         if without_schema:
             return f'"{sf_table_name.upper()}"'
