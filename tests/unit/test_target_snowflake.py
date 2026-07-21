@@ -3,10 +3,11 @@ import json
 import unittest
 import os
 import itertools
+import tempfile
 
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import target_snowflake
 
@@ -174,3 +175,76 @@ class TestTargetSnowflake(unittest.TestCase):
             buf.getvalue().strip(),
             '{"bookmarks": {"tap_mysql_test-test_simple_table": {"replication_key": "id", '
             '"replication_key_value": 100, "version": 1}}}')
+
+    # --- PQ-3547: a failed Snowflake load must raise (not be swallowed) so that
+    #     state is never advanced past data that was not actually written. ---
+
+    def _make_db_sync_with_local_file(self):
+        """Build a fake db_sync whose formatter produces a real temp file on disk."""
+        fd, tmp_path = tempfile.mkstemp(suffix='.csv.gz')
+        with os.fdopen(fd, 'w') as file_handle:
+            file_handle.write('some,data\n1,2\n')
+
+        db_sync = MagicMock()
+        db_sync.file_format.formatter.records_to_file.return_value = tmp_path
+        db_sync.data_flattening_max_level = 0
+        return db_sync, tmp_path
+
+    def test_flush_records_raises_when_put_to_stage_fails_and_removes_local_file(self):
+        """A failing PUT-to-stage must propagate and the local temp file must be cleaned up."""
+        db_sync, tmp_path = self._make_db_sync_with_local_file()
+        db_sync.put_to_stage.side_effect = RuntimeError('PUT to stage failed')
+
+        try:
+            with self.assertRaises(RuntimeError):
+                target_snowflake.flush_records('tap_test-some_table', [{'id': 1}], db_sync)
+
+            # The load never completed, so COPY (load_file) must not have run ...
+            db_sync.load_file.assert_not_called()
+            # ... and the local temp file must not leak.
+            self.assertFalse(
+                os.path.exists(tmp_path),
+                'local temp file should be removed even when the load fails')
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def test_flush_records_raises_when_load_file_fails_and_removes_local_file(self):
+        """A failing COPY (load_file) must propagate and the local temp file must be cleaned up."""
+        db_sync, tmp_path = self._make_db_sync_with_local_file()
+        db_sync.put_to_stage.return_value = 'some-s3-folder/some-name.csv.gz'
+        db_sync.load_file.side_effect = RuntimeError('Snowflake COPY failed')
+
+        try:
+            with self.assertRaises(RuntimeError):
+                target_snowflake.flush_records('tap_test-some_table', [{'id': 1}], db_sync)
+
+            self.assertFalse(
+                os.path.exists(tmp_path),
+                'local temp file should be removed even when the load fails')
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    @patch('target_snowflake.os.remove')
+    @patch('target_snowflake.DbSync')
+    def test_load_failure_prevents_state_emission(self, dbSync_mock, os_remove_mock):
+        """
+        End-to-end: if the Snowflake load fails during a flush, persist_lines must raise
+        BEFORE any state is emitted, so the bookmark never advances past unwritten data.
+        """
+        with open(f'{os.path.dirname(__file__)}/resources/messages-simple-table.json', 'r') as f:
+            lines = f.readlines()
+
+        instance = dbSync_mock.return_value
+        instance.create_schema_if_not_exists.return_value = None
+        instance.sync_table.return_value = None
+        instance.put_to_stage.side_effect = RuntimeError('Snowflake COPY failed')
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            with self.assertRaises(RuntimeError):
+                target_snowflake.persist_lines(self.config, lines)
+
+        # emit_state writes to stdout; because the load failed, nothing must have been emitted.
+        self.assertEqual(buf.getvalue().strip(), '')

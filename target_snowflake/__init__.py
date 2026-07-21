@@ -452,16 +452,20 @@ def flush_records(stream: str,
     row_count = len(records)
     size_bytes = os.path.getsize(filepath)
 
-    upload_failed = False
     # Upload to s3 and load into Snowflake
     try:
         s3_key = db_sync.put_to_stage(filepath, stream, row_count, temp_dir=temp_dir)
         db_sync.load_file(s3_key, row_count, size_bytes)
-    except Exception as ex:
-        LOGGER.error("Failed to load file %s into Snowflake: %s", filepath, ex)
-        upload_failed = True
+    except Exception:
+        LOGGER.error("Failed to load file %s into Snowflake", filepath)
+        # Clean up the local temp file, then propagate the error so the caller
+        # (load_stream_batch -> flush_streams -> persist_lines) never reaches
+        # emit_state for this flush. This prevents the bookmark from advancing
+        # past data that was not actually written to Snowflake (PQ-3547).
+        os.remove(filepath)
+        raise
 
-    # Delete file from local disk
+    # Delete file from local disk (only reached on a successful load)
     os.remove(filepath)
 
     if archive_load_files:
@@ -498,9 +502,8 @@ def flush_records(stream: str,
             LOGGER.error("Failed to copy file %s to archive: %s", s3_key, ex)
 
     try:
-        if not upload_failed:
-            # Delete file from S3
-            db_sync.delete_from_stage(stream, s3_key)
+        # Delete file from S3 (only reached on a successful load)
+        db_sync.delete_from_stage(stream, s3_key)
     except Exception as ex:
         LOGGER.error("Failed to delete file from S3: %s", ex)
 
