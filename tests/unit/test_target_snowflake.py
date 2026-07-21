@@ -248,3 +248,27 @@ class TestTargetSnowflake(unittest.TestCase):
 
         # emit_state writes to stdout; because the load failed, nothing must have been emitted.
         self.assertEqual(buf.getvalue().strip(), '')
+
+    @patch('target_snowflake.emit_state')
+    @patch('target_snowflake.flush_streams')
+    @patch('target_snowflake.DbSync')
+    def test_sync_table_failure_prevents_state_emission(self, dbSync_mock, flush_streams_mock, emit_state_mock):
+        """
+        Schema-evolution (sync_table) failure must propagate out of persist_lines and
+        prevent any state from being emitted, so the bookmark never advances past a
+        table whose schema was not actually synced.
+        """
+        with open(f'{os.path.dirname(__file__)}/resources/messages-simple-table.json', 'r') as f:
+            lines = f.readlines()
+
+        instance = dbSync_mock.return_value
+        instance.create_schema_if_not_exists.return_value = None
+        instance.sync_table.side_effect = RuntimeError('ALTER TABLE add column failed')
+
+        flush_streams_mock.return_value = '{"currently_syncing": null}'
+
+        with self.assertRaises(RuntimeError):
+            target_snowflake.persist_lines(self.config, lines)
+
+        # Because sync_table failed, persist_lines must never reach emit_state.
+        emit_state_mock.assert_not_called()

@@ -303,10 +303,7 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
                         )
 
                 stream_to_sync[stream].create_schema_if_not_exists()
-                try:
-                    stream_to_sync[stream].sync_table()
-                except Exception as ex:
-                    LOGGER.error("Failed to sync table for stream %s: %s", stream, ex)
+                stream_to_sync[stream].sync_table()
 
                 row_count[stream] = 0
                 total_row_count[stream] = 0
