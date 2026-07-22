@@ -2,6 +2,7 @@ import io
 import json
 import unittest
 import os
+import copy
 import itertools
 import tempfile
 
@@ -272,3 +273,86 @@ class TestTargetSnowflake(unittest.TestCase):
 
         # Because sync_table failed, persist_lines must never reach emit_state.
         emit_state_mock.assert_not_called()
+
+    # --- PQ-3547: a completed (small) table must be checkpointed at the next
+    #     table's SCHEMA boundary, so a kill during the next table can resume
+    #     from the completed one instead of re-syncing it from EOF. ---
+
+    @patch('target_snowflake.emit_state')
+    @patch('target_snowflake.flush_streams')
+    @patch('target_snowflake.DbSync')
+    def test_completed_table_flushed_and_bookmarked_at_next_schema_boundary(
+            self, dbSync_mock, flush_streams_mock, emit_state_mock):
+        """
+        Two small streams (each below batch_size). Feed SCHEMA A, a few RECORDs
+        for A, STATE A, then SCHEMA B. Table A must be flushed and its bookmark
+        emitted AT the SCHEMA-B boundary - not deferred to EOF.
+
+        Also asserts batching WITHIN a table is preserved: multiple records
+        below batch_size do NOT trigger a per-record flush.
+        """
+        stream_a = 'tap_test-table_a'
+        stream_b = 'tap_test-table_b'
+
+        schema = {'properties': {'id': {'type': ['integer']}}, 'type': 'object'}
+
+        def _schema(stream):
+            return json.dumps({'type': 'SCHEMA', 'stream': stream,
+                               'schema': schema, 'key_properties': ['id']})
+
+        def _record(stream, rid):
+            return json.dumps({'type': 'RECORD', 'stream': stream,
+                               'record': {'id': rid}, 'version': 1})
+
+        def _state(stream, value):
+            return json.dumps({'type': 'STATE', 'value': {'bookmarks': {
+                stream: {'replication_key': 'id', 'replication_key_value': value}}}})
+
+        # Table A completes (3 records, well below batch_size) then table B's
+        # SCHEMA arrives -> A must be checkpointed at that boundary.
+        lines = [
+            _schema(stream_a),
+            _record(stream_a, 1),
+            _record(stream_a, 2),
+            _record(stream_a, 3),
+            _state(stream_a, 3),
+            _schema(stream_b),
+            _record(stream_b, 4),
+            _record(stream_b, 5),
+            _state(stream_b, 5),
+        ]
+
+        instance = dbSync_mock.return_value
+        instance.create_schema_if_not_exists.return_value = None
+        instance.sync_table.return_value = None
+        # Distinct primary keys per record so records genuinely accumulate
+        # (otherwise a single MagicMock PK would collapse them into one).
+        instance.record_primary_key_string.side_effect = lambda record: str(record['id'])
+
+        # Mimic the real (no-filter) flush_streams: reset row counts and return
+        # a deepcopy of the current state, so we can observe which bookmark gets
+        # emitted at each boundary - without touching Snowflake.
+        def _fake_flush(streams, row_count, stream_to_sync, config, state,
+                        flushed_state, archive_load_files_data, filter_streams=None):
+            for buffered_stream in list(row_count.keys()):
+                row_count[buffered_stream] = 0
+            return copy.deepcopy(state)
+
+        flush_streams_mock.side_effect = _fake_flush
+
+        target_snowflake.persist_lines(self.config, lines)
+
+        # Exactly two flushes: table A at the SCHEMA-B boundary, table B at EOF.
+        # Pre-fix this is 1 (only the EOF flush), so this assertion goes red.
+        self.assertEqual(flush_streams_mock.call_count, 2,
+                         'expected a flush at the SCHEMA-B boundary (table A) and one at EOF (table B)')
+        self.assertEqual(emit_state_mock.call_count, 2,
+                         'expected a bookmark emitted at the SCHEMA-B boundary and at EOF')
+
+        # The FIRST emitted bookmark (at the B boundary) must be table A's,
+        # and must NOT yet contain table B - proving A is checkpointed before B.
+        first_emitted_state = emit_state_mock.call_args_list[0].args[0]
+        self.assertIn(stream_a, first_emitted_state['bookmarks'])
+        self.assertEqual(
+            first_emitted_state['bookmarks'][stream_a]['replication_key_value'], 3)
+        self.assertNotIn(stream_b, first_emitted_state['bookmarks'])

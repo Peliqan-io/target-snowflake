@@ -224,6 +224,24 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
             if 'stream' not in o:
                 raise Exception(f"Line is missing required key 'stream': {line}")
 
+            # PQ-3547: complete the PREVIOUS table before starting a NEW one.
+            # When a genuinely different stream's SCHEMA arrives, flush the
+            # records still buffered for the previous table (making them
+            # durable) and emit their bookmark, so a kill during the next table
+            # resumes from this completed one. A flush failure raises (fail-loud,
+            # this PR), so no state is emitted past unwritten data.
+            #
+            # Only records belonging to OTHER streams are flushed here. Records
+            # for the incoming stream are left buffered so that batching WITHIN a
+            # table is unchanged (they accumulate until batch_size), and a
+            # re-emitted or evolved schema for the SAME stream is still handled
+            # by the schema-change flush below - not turned into an extra flush.
+            if any(count > 0 for buffered_stream, count in row_count.items()
+                   if buffered_stream != o['stream']):
+                flushed_state = flush_streams(records_to_load, row_count, stream_to_sync,
+                                              config, state, flushed_state, archive_load_files_data)
+                emit_state(copy.deepcopy(flushed_state))
+
             stream = o['stream']
             new_schema = stream_utils.float_to_decimal(o['schema'])
 
