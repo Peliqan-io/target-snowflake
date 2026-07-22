@@ -356,3 +356,81 @@ class TestTargetSnowflake(unittest.TestCase):
         self.assertEqual(
             first_emitted_state['bookmarks'][stream_a]['replication_key_value'], 3)
         self.assertNotIn(stream_b, first_emitted_state['bookmarks'])
+
+    @patch('target_snowflake.emit_state')
+    @patch('target_snowflake.flush_streams')
+    @patch('target_snowflake.DbSync')
+    def test_completed_table_bookmarked_at_boundary_when_final_batch_already_flushed(
+            self, dbSync_mock, flush_streams_mock, emit_state_mock):
+        """
+        Exact-batch-size case: table A ends EXACTLY on batch_size_rows, so its
+        last batch is already flushed (row_count[A] == 0) before A's STATE
+        arrives. When SCHEMA B (a different stream) arrives, A's bookmark must
+        STILL be emitted at that boundary even though nothing is buffered -
+        otherwise a kill during B cannot resume from the completed table A.
+
+        Pre-fix the boundary emit is guarded by 'any buffered rows', so with
+        nothing buffered A's bookmark is only emitted at EOF -> this goes red.
+        """
+        self.config['batch_size_rows'] = 2
+
+        stream_a = 'tap_test-table_a'
+        stream_b = 'tap_test-table_b'
+        schema = {'properties': {'id': {'type': ['integer']}}, 'type': 'object'}
+
+        def _schema(stream):
+            return json.dumps({'type': 'SCHEMA', 'stream': stream,
+                               'schema': schema, 'key_properties': ['id']})
+
+        def _record(stream, rid):
+            return json.dumps({'type': 'RECORD', 'stream': stream,
+                               'record': {'id': rid}, 'version': 1})
+
+        def _state(stream, value):
+            return json.dumps({'type': 'STATE', 'value': {'bookmarks': {
+                stream: {'replication_key': 'id', 'replication_key_value': value}}}})
+
+        # Exactly batch_size_rows (2) records for A -> A's final batch flushes and
+        # row_count[A] returns to 0. Then STATE A arrives, then SCHEMA B (the
+        # boundary) - with nothing buffered for A at that point.
+        lines = [
+            _schema(stream_a),
+            _record(stream_a, 1),
+            _record(stream_a, 2),
+            _state(stream_a, 2),
+            _schema(stream_b),
+        ]
+
+        instance = dbSync_mock.return_value
+        instance.create_schema_if_not_exists.return_value = None
+        instance.sync_table.return_value = None
+        # Distinct primary keys so the two records genuinely fill the batch.
+        instance.record_primary_key_string.side_effect = lambda record: str(record['id'])
+
+        # Mimic the real flush_streams: reset row counts and return a deepcopy of
+        # the current state, so we can observe which bookmark gets emitted.
+        def _fake_flush(streams, row_count, stream_to_sync, config, state,
+                        flushed_state, archive_load_files_data, filter_streams=None):
+            for buffered_stream in list(row_count.keys()):
+                row_count[buffered_stream] = 0
+            return copy.deepcopy(state)
+
+        flush_streams_mock.side_effect = _fake_flush
+
+        target_snowflake.persist_lines(self.config, lines)
+
+        # Collect every emitted state that carries A's (and only A's) bookmark.
+        # Emits are: None (the batch flush, before STATE A), A (the B boundary),
+        # A (EOF). Pre-fix the B-boundary emit is missing, so A appears once.
+        emitted_a = [
+            call.args[0] for call in emit_state_mock.call_args_list
+            if call.args[0] is not None
+            and stream_a in call.args[0].get('bookmarks', {})
+            and stream_b not in call.args[0].get('bookmarks', {})
+        ]
+        self.assertGreaterEqual(
+            len(emitted_a), 2,
+            "table A's bookmark must be emitted at the SCHEMA-B boundary (not only "
+            "at EOF) even though A's final batch was already flushed")
+        self.assertEqual(
+            emitted_a[0]['bookmarks'][stream_a]['replication_key_value'], 2)
