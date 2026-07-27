@@ -253,26 +253,45 @@ class TestTargetSnowflake(unittest.TestCase):
     @patch('target_snowflake.emit_state')
     @patch('target_snowflake.flush_streams')
     @patch('target_snowflake.DbSync')
-    def test_sync_table_failure_prevents_state_emission(self, dbSync_mock, flush_streams_mock, emit_state_mock):
+    def test_sync_table_failure_logs_and_skips_stream(self, dbSync_mock, flush_streams_mock, emit_state_mock):
         """
-        Schema-evolution (sync_table) failure must propagate out of persist_lines and
-        prevent any state from being emitted, so the bookmark never advances past a
-        table whose schema was not actually synced.
+        Schema-evolution (sync_table) failure must be logged and the stream
+        skipped — pipeline continues for other tables, and the failed stream's
+        bookmark is never advanced (so the next run retries sync_table).
         """
-        with open(f'{os.path.dirname(__file__)}/resources/messages-simple-table.json', 'r') as f:
-            lines = f.readlines()
+        stream_ok = 'tap_test-table_ok'
+        stream_bad = 'tap_test-table_bad'
+        schema = {'properties': {'id': {'type': ['integer']}}, 'type': 'object'}
+
+        lines = [
+            json.dumps({'type': 'SCHEMA', 'stream': stream_ok,
+                        'schema': schema, 'key_properties': ['id']}),
+            json.dumps({'type': 'RECORD', 'stream': stream_ok,
+                        'record': {'id': 1}}),
+            json.dumps({'type': 'STATE', 'value': {'bookmarks': {
+                stream_ok: {'id': 1}, stream_bad: {'id': 99}}}}),
+            json.dumps({'type': 'SCHEMA', 'stream': stream_bad,
+                        'schema': schema, 'key_properties': ['id']}),
+            json.dumps({'type': 'RECORD', 'stream': stream_bad,
+                        'record': {'id': 2}}),
+            json.dumps({'type': 'STATE', 'value': {'bookmarks': {
+                stream_ok: {'id': 1}, stream_bad: {'id': 100}}}}),
+        ]
 
         instance = dbSync_mock.return_value
         instance.create_schema_if_not_exists.return_value = None
-        instance.sync_table.side_effect = RuntimeError('ALTER TABLE add column failed')
+        instance.sync_table.side_effect = [None, RuntimeError('column already exists')]
+        instance.record_primary_key_string.return_value = 'pk-1'
 
-        flush_streams_mock.return_value = '{"currently_syncing": null}'
+        flush_streams_mock.return_value = {'bookmarks': {stream_ok: {'id': 1}}}
 
-        with self.assertRaises(RuntimeError):
-            target_snowflake.persist_lines(self.config, lines)
+        target_snowflake.persist_lines(self.config, lines)
 
-        # Because sync_table failed, persist_lines must never reach emit_state.
-        emit_state_mock.assert_not_called()
+        # The failed stream's bookmark must NOT appear in any emitted state
+        for call_args in emit_state_mock.call_args_list:
+            emitted = call_args[0][0]
+            if emitted and isinstance(emitted, dict):
+                self.assertNotIn(stream_bad, emitted.get('bookmarks', {}))
 
     # --- PQ-3547: a completed (small) table must be checkpointed at the next
     #     table's SCHEMA boundary, so a kill during the next table can resume
@@ -333,7 +352,8 @@ class TestTargetSnowflake(unittest.TestCase):
         # a deepcopy of the current state, so we can observe which bookmark gets
         # emitted at each boundary - without touching Snowflake.
         def _fake_flush(streams, row_count, stream_to_sync, config, state,
-                        flushed_state, archive_load_files_data, filter_streams=None):
+                        flushed_state, archive_load_files_data, filter_streams=None,
+                        schema_failed_streams=frozenset()):
             for buffered_stream in list(row_count.keys()):
                 row_count[buffered_stream] = 0
             return copy.deepcopy(state)
@@ -410,7 +430,8 @@ class TestTargetSnowflake(unittest.TestCase):
         # Mimic the real flush_streams: reset row counts and return a deepcopy of
         # the current state, so we can observe which bookmark gets emitted.
         def _fake_flush(streams, row_count, stream_to_sync, config, state,
-                        flushed_state, archive_load_files_data, filter_streams=None):
+                        flushed_state, archive_load_files_data, filter_streams=None,
+                        schema_failed_streams=frozenset()):
             for buffered_stream in list(row_count.keys()):
                 row_count[buffered_stream] = 0
             return copy.deepcopy(state)

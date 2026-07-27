@@ -115,6 +115,7 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
     flush_timestamp = datetime.utcnow()
     archive_load_files = config.get('archive_load_files', False)
     archive_load_files_data = {}
+    schema_failed_streams = set()
 
     # Loop over lines from stdin
     for line in lines:
@@ -135,6 +136,11 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
             if o['stream'] not in schemas:
                 raise Exception(
                     f"A record for stream {o['stream']} was encountered before a corresponding schema")
+
+            # Skip records for streams whose schema DDL failed — their data
+            # cannot be loaded reliably and the bookmark must not advance.
+            if o['stream'] in schema_failed_streams:
+                continue
 
             # Get schema for this record's stream
             stream = o['stream']
@@ -214,7 +220,8 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
                     state,
                     flushed_state,
                     archive_load_files_data,
-                    filter_streams=filter_streams)
+                    filter_streams=filter_streams,
+                    schema_failed_streams=schema_failed_streams)
 
                 flush_timestamp = datetime.utcnow()
 
@@ -237,7 +244,8 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
             if current_stream is not None and incoming_stream != current_stream:
                 if sum(row_count.values()) > 0:
                     flushed_state = flush_streams(records_to_load, row_count, stream_to_sync,
-                                                  config, state, flushed_state, archive_load_files_data)
+                                                  config, state, flushed_state, archive_load_files_data,
+                                                  schema_failed_streams=schema_failed_streams)
                 emit_state(copy.deepcopy(flushed_state))
             current_stream = incoming_stream
 
@@ -267,7 +275,8 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
                                                   state,
                                                   flushed_state,
                                                   archive_load_files_data,
-                                                  filter_streams=filter_streams)
+                                                  filter_streams=filter_streams,
+                                                  schema_failed_streams=schema_failed_streams)
 
                     # emit latest encountered state
                     emit_state(flushed_state)
@@ -320,7 +329,11 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
                         )
 
                 stream_to_sync[stream].create_schema_if_not_exists()
-                stream_to_sync[stream].sync_table()
+                try:
+                    stream_to_sync[stream].sync_table()
+                except Exception as ex:
+                    LOGGER.error("Failed to sync table for stream %s: %s", stream, ex)
+                    schema_failed_streams.add(stream)
 
                 row_count[stream] = 0
                 total_row_count[stream] = 0
@@ -335,6 +348,8 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
             # # set flushed state if it's not defined or there are no records so far
             if not flushed_state or sum(row_count.values()) == 0:
                 flushed_state = copy.deepcopy(state)
+                for s in schema_failed_streams:
+                    flushed_state.get('bookmarks', {}).pop(s, None)
 
         else:
             raise Exception(f"Unknown message type {o['type']} in message {o}")
@@ -344,7 +359,8 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
     if sum(row_count.values()) > 0:
         # flush all streams one last time, delete records if needed, reset counts and then emit current state
         flushed_state = flush_streams(records_to_load, row_count, stream_to_sync, config, state, flushed_state,
-                                      archive_load_files_data)
+                                      archive_load_files_data,
+                                      schema_failed_streams=schema_failed_streams)
 
     # emit latest state
     emit_state(copy.deepcopy(flushed_state))
@@ -359,7 +375,8 @@ def flush_streams(
         state,
         flushed_state,
         archive_load_files_data,
-        filter_streams=None):
+        filter_streams=None,
+        schema_failed_streams=frozenset()):
     """
     Flushes all buckets and resets records count to 0 as well as empties records to load list
     :param streams: dictionary with records to load per stream
@@ -408,6 +425,8 @@ def flush_streams(
         # If we flush every bucket use the latest state
         else:
             flushed_state = copy.deepcopy(state)
+            for s in schema_failed_streams:
+                flushed_state.get('bookmarks', {}).pop(s, None)
 
         if stream in archive_load_files_data:
             archive_load_files_data[stream]['min'] = None
