@@ -348,6 +348,8 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
             # # set flushed state if it's not defined or there are no records so far
             if not flushed_state or sum(row_count.values()) == 0:
                 flushed_state = copy.deepcopy(state)
+                for s in schema_failed_streams:
+                    flushed_state.get('bookmarks', {}).pop(s, None)
 
         else:
             raise Exception(f"Unknown message type {o['type']} in message {o}")
@@ -423,6 +425,8 @@ def flush_streams(
         # If we flush every bucket use the latest state
         else:
             flushed_state = copy.deepcopy(state)
+            for s in schema_failed_streams:
+                flushed_state.get('bookmarks', {}).pop(s, None)
 
         if stream in archive_load_files_data:
             archive_load_files_data[stream]['min'] = None
