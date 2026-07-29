@@ -455,3 +455,64 @@ class TestTargetSnowflake(unittest.TestCase):
             "at EOF) even though A's final batch was already flushed")
         self.assertEqual(
             emitted_a[0]['bookmarks'][stream_a]['replication_key_value'], 2)
+
+
+class TestSchemaFailedBookmarkOmission(unittest.TestCase):
+    """PQ-3547: a DDL-failed stream's bookmark must be OMITTED from emitted
+    state (pop), never advanced.
+
+    The tap advances its bookmark on successful extract regardless of target
+    failures, so the cumulative STATE arriving after the failed stream's
+    records already carries the advanced value. Emitting it would move
+    state.json past data that was never loaded. Omission is safe because
+    both baserow state writers (live state_writer and the post-run
+    merge_final_state fallback) merge: an omitted key keeps its prior value.
+
+    Unlike the older tests, flush_streams is NOT mocked here -- the pop
+    lives inside flush_streams' state construction, which mocking hid.
+    """
+
+    @patch('target_snowflake.load_stream_batch')
+    @patch('target_snowflake.DbSync')
+    def test_ddl_failed_stream_omitted_from_final_state(self, dbSync_mock,
+                                                        load_stream_batch_mock):
+        # stream a syncs fine; stream c's DDL fails
+        instance = dbSync_mock.return_value
+        instance.create_schema_if_not_exists.return_value = None
+        instance.sync_table.side_effect = [None, RuntimeError('T3 exists as VIEW')]
+        instance.record_primary_key_string.return_value = 'pk1'
+        load_stream_batch_mock.return_value = None
+
+        schema = {'type': 'object', 'properties': {'id': {'type': 'integer'}}}
+        lines = [
+            json.dumps({'type': 'SCHEMA', 'stream': 'a', 'schema': schema,
+                        'key_properties': ['id']}),
+            json.dumps({'type': 'RECORD', 'stream': 'a', 'record': {'id': 1}}),
+            json.dumps({'type': 'STATE',
+                        'value': {'bookmarks': {'a': 'A2', 'c': 'C1'}}}),
+            json.dumps({'type': 'SCHEMA', 'stream': 'c', 'schema': schema,
+                        'key_properties': ['id']}),
+            json.dumps({'type': 'RECORD', 'stream': 'c', 'record': {'id': 9}}),
+            # tap already advanced c on extract -- the poisoned cumulative state
+            json.dumps({'type': 'STATE',
+                        'value': {'bookmarks': {'a': 'A2', 'c': 'C2'}}}),
+        ]
+
+        with patch('target_snowflake.emit_state') as emit_state_mock:
+            target_snowflake.persist_lines(self.config if hasattr(self, 'config') else {},
+                                           lines)
+
+        emitted = [c.args[0] for c in emit_state_mock.call_args_list
+                   if c.args[0] is not None]
+        self.assertTrue(emitted, 'expected at least one emitted state')
+        # the advanced C2 must never be certified by the target
+        for state in emitted:
+            self.assertNotEqual(state.get('bookmarks', {}).get('c'), 'C2',
+                                f'advanced bookmark leaked: {state}')
+        # final state: a advanced, c omitted entirely (merge keeps prior C1)
+        final = emitted[-1]
+        self.assertEqual(final['bookmarks'].get('a'), 'A2')
+        self.assertNotIn('c', final['bookmarks'])
+        # c's records were skipped, never handed to the loader
+        for call in load_stream_batch_mock.call_args_list:
+            self.assertNotEqual(call.kwargs.get('stream'), 'c')
