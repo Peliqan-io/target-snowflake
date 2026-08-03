@@ -102,6 +102,7 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
     """
     state = None
     flushed_state = None
+    current_stream = None
     schemas = {}
     key_properties = {}
     validators = {}
@@ -114,6 +115,7 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
     flush_timestamp = datetime.utcnow()
     archive_load_files = config.get('archive_load_files', False)
     archive_load_files_data = {}
+    schema_failed_streams = set()
 
     # Loop over lines from stdin
     for line in lines:
@@ -134,6 +136,11 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
             if o['stream'] not in schemas:
                 raise Exception(
                     f"A record for stream {o['stream']} was encountered before a corresponding schema")
+
+            # Skip records for streams whose schema DDL failed — their data
+            # cannot be loaded reliably and the bookmark must not advance.
+            if o['stream'] in schema_failed_streams:
+                continue
 
             # Get schema for this record's stream
             stream = o['stream']
@@ -213,7 +220,8 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
                     state,
                     flushed_state,
                     archive_load_files_data,
-                    filter_streams=filter_streams)
+                    filter_streams=filter_streams,
+                    schema_failed_streams=schema_failed_streams)
 
                 flush_timestamp = datetime.utcnow()
 
@@ -223,6 +231,23 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
         elif t == 'SCHEMA':
             if 'stream' not in o:
                 raise Exception(f"Line is missing required key 'stream': {line}")
+
+            incoming_stream = o['stream']
+            # PQ-3547: at a genuine table boundary (a DIFFERENT stream's SCHEMA),
+            # complete the previous table — flush any records still buffered for
+            # it (durable), then emit the latest durable bookmark. Emit even when
+            # the previous table's final batch was already flushed at batch_size
+            # and nothing is buffered, so its STATE is still published here. A
+            # same-stream re-emit/evolution is NOT a boundary (batching within a
+            # table preserved; handled by the schema-change flush below). A flush
+            # failure raises (fail-loud) -> no state emitted past unwritten data.
+            if current_stream is not None and incoming_stream != current_stream:
+                if sum(row_count.values()) > 0:
+                    flushed_state = flush_streams(records_to_load, row_count, stream_to_sync,
+                                                  config, state, flushed_state, archive_load_files_data,
+                                                  schema_failed_streams=schema_failed_streams)
+                emit_state(copy.deepcopy(flushed_state))
+            current_stream = incoming_stream
 
             stream = o['stream']
             new_schema = stream_utils.float_to_decimal(o['schema'])
@@ -250,7 +275,8 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
                                                   state,
                                                   flushed_state,
                                                   archive_load_files_data,
-                                                  filter_streams=filter_streams)
+                                                  filter_streams=filter_streams,
+                                                  schema_failed_streams=schema_failed_streams)
 
                     # emit latest encountered state
                     emit_state(flushed_state)
@@ -307,6 +333,7 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
                     stream_to_sync[stream].sync_table()
                 except Exception as ex:
                     LOGGER.error("Failed to sync table for stream %s: %s", stream, ex)
+                    schema_failed_streams.add(stream)
 
                 row_count[stream] = 0
                 total_row_count[stream] = 0
@@ -321,6 +348,8 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
             # # set flushed state if it's not defined or there are no records so far
             if not flushed_state or sum(row_count.values()) == 0:
                 flushed_state = copy.deepcopy(state)
+                for s in schema_failed_streams:
+                    flushed_state.get('bookmarks', {}).pop(s, None)
 
         else:
             raise Exception(f"Unknown message type {o['type']} in message {o}")
@@ -330,7 +359,8 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
     if sum(row_count.values()) > 0:
         # flush all streams one last time, delete records if needed, reset counts and then emit current state
         flushed_state = flush_streams(records_to_load, row_count, stream_to_sync, config, state, flushed_state,
-                                      archive_load_files_data)
+                                      archive_load_files_data,
+                                      schema_failed_streams=schema_failed_streams)
 
     # emit latest state
     emit_state(copy.deepcopy(flushed_state))
@@ -345,7 +375,8 @@ def flush_streams(
         state,
         flushed_state,
         archive_load_files_data,
-        filter_streams=None):
+        filter_streams=None,
+        schema_failed_streams=frozenset()):
     """
     Flushes all buckets and resets records count to 0 as well as empties records to load list
     :param streams: dictionary with records to load per stream
@@ -394,6 +425,8 @@ def flush_streams(
         # If we flush every bucket use the latest state
         else:
             flushed_state = copy.deepcopy(state)
+            for s in schema_failed_streams:
+                flushed_state.get('bookmarks', {}).pop(s, None)
 
         if stream in archive_load_files_data:
             archive_load_files_data[stream]['min'] = None
@@ -452,16 +485,20 @@ def flush_records(stream: str,
     row_count = len(records)
     size_bytes = os.path.getsize(filepath)
 
-    upload_failed = False
     # Upload to s3 and load into Snowflake
     try:
         s3_key = db_sync.put_to_stage(filepath, stream, row_count, temp_dir=temp_dir)
         db_sync.load_file(s3_key, row_count, size_bytes)
-    except Exception as ex:
-        LOGGER.error("Failed to load file %s into Snowflake: %s", filepath, ex)
-        upload_failed = True
+    except Exception:
+        LOGGER.error("Failed to load file %s into Snowflake", filepath)
+        # Clean up the local temp file, then propagate the error so the caller
+        # (load_stream_batch -> flush_streams -> persist_lines) never reaches
+        # emit_state for this flush. This prevents the bookmark from advancing
+        # past data that was not actually written to Snowflake (PQ-3547).
+        os.remove(filepath)
+        raise
 
-    # Delete file from local disk
+    # Delete file from local disk (only reached on a successful load)
     os.remove(filepath)
 
     if archive_load_files:
@@ -498,9 +535,8 @@ def flush_records(stream: str,
             LOGGER.error("Failed to copy file %s to archive: %s", s3_key, ex)
 
     try:
-        if not upload_failed:
-            # Delete file from S3
-            db_sync.delete_from_stage(stream, s3_key)
+        # Delete file from S3 (only reached on a successful load)
+        db_sync.delete_from_stage(stream, s3_key)
     except Exception as ex:
         LOGGER.error("Failed to delete file from S3: %s", ex)
 
