@@ -441,7 +441,7 @@ class DbSync:
         sf_table_name = table_name.replace('.', '_').replace('-', '_').lower()
 
         if is_temporary:
-            sf_table_name = f'{TEMP_TABLE_MARKER}{sf_table_name}_temp'
+            sf_table_name = f'{TEMP_TABLE_MARKER}{sf_table_name}'
 
         if without_schema:
             return f'"{sf_table_name.upper()}"'
